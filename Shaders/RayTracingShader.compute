@@ -1,0 +1,465 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+static const float PI = 3.1415;
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+// Image Settings
+float4 backgroundColor;
+
+// Camera Info
+float _CameraFov;
+float3 _CameraWorldPosition;
+float4x4 _CameraToWorldMatrix;
+float4x4 _CameraInverseProjection;
+bool _UseUnityCameraPerspective;
+
+// RayTracing Properties
+uint _AllowLocalAmbientComponent;
+uint _AllowLocalDiffuseComponent;
+uint _AllowLocalSpecularComponent;
+uint _AllowLocalRefractiveComponent;
+uint _AllowGlobalAmbientComponent;
+uint _AllowGlobalDiffuseComponent;
+uint _AllowGlobalSpecularComponent;
+uint _AllowGlobalRefractionComponent;
+
+
+int _MaxRecursionDepth;
+// TODO: Specular, Refraction
+uint _NumRaysPerPixel;
+uint _AllowAntiAliasing;
+
+struct RayTracingMaterial
+{
+    float4 color;
+    float ambientFactor;
+    float diffuseFactor;
+    float specularFactor;
+    float refractionFactor;
+    float ior;
+};
+
+struct SphereInfo
+{
+    float3 center;
+    float radius;
+    RayTracingMaterial material;
+};
+
+struct Ray
+{
+    float3 origin;
+    float3 dir;
+    float3 invDir;
+};
+
+struct MeshInfo
+{
+    int triangleStart;
+    int triangleCount;
+    RayTracingMaterial material;
+    float3 boundsMin;
+    float3 boundsMax;
+};
+
+struct TriangleInfo
+{
+    float3 vertexA;
+    float3 vertexB;
+    float3 vertexC;
+    
+    float3 normalA;
+    float3 normalB;
+    float3 normalC;
+};
+
+struct HitInfo
+{
+    bool didHit;
+    float distance;
+    float3 hitPoint;
+    float3 normal;
+    RayTracingMaterial material;
+};
+
+struct LightInfo
+{
+    float3 position;
+    float4 color;
+};
+
+// Buffers
+StructuredBuffer<SphereInfo> SphereInfoBuffer;
+StructuredBuffer<MeshInfo> MeshInfoBuffer;
+StructuredBuffer<TriangleInfo> TriangleInfoBuffer;
+StructuredBuffer<LightInfo> LightInfoBuffer;
+int _SphereInfoCount;
+int _MeshInfoCount;
+int _TriangleInfoCount;
+int _LightInfoCount;
+
+
+// PCG (permuted congruential generator). Thanks to:
+// www.pcg-random.org and www.shadertoy.com/view/XlGcRh
+uint NextRandom(inout uint state)
+{
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result;
+}
+
+float RandomValue(inout uint state)
+{
+    return NextRandom(state) / 4294967295.0; // 2^32 - 1
+}
+
+float2 RandomPointInCircle(inout uint rngState)
+{
+    float angle = RandomValue(rngState) * 2 * PI;
+    float2 pointOnCircle = float2(cos(angle), sin(angle));
+    return pointOnCircle * sqrt(RandomValue(rngState));
+}
+
+//Thanks to https://www.gamedeveloper.com/programming/gpu-ray-tracing-in-unity-part-1
+Ray CreateCameraRay(float2 uv, uint state)
+{
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv + _AllowAntiAliasing * RandomPointInCircle(state) / 200 , 0.0, 1.0)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorldMatrix, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    Ray ray = (Ray) 0;
+    ray.origin = _CameraWorldPosition;
+    ray.dir = direction;
+    ray.invDir = 1 / direction;
+    
+    return ray;
+}
+
+Ray GenerateRay(uint2 pixel, uint2 dimensions, uint state)
+{
+    // Calculate field of view scaling
+    float halfTanFov = tan(radians(_CameraFov) * 0.5);
+    
+    // New Stuff
+    float height = 2.0 * _CameraWorldPosition.z * halfTanFov;
+    float width = height * (dimensions.x / dimensions.y);
+    float s = height / dimensions.y;
+    
+    float3 tmp;
+    tmp.x = (pixel.x + 0.5) * s - width / 2.0;
+    tmp.y = (pixel.y + 0.5) * s - height / 2.0;
+    tmp.z = 0.0;
+    
+    Ray ray;
+    ray.origin = _CameraWorldPosition;
+    ray.dir = normalize(float3(-tmp.x, tmp.y, -_CameraWorldPosition.z) + _AllowAntiAliasing * float3(RandomPointInCircle(state) / 25, 0.0));
+    
+    ray.invDir = 1 / ray.dir;
+    
+    return ray;
+}
+
+HitInfo RaySphereIntersection(Ray ray, SphereInfo sphere)
+{
+    HitInfo hitInfo = (HitInfo)0;
+    float3 offsetRayOrigin = ray.origin - sphere.center;
+    
+    float a = dot(ray.dir, ray.dir);
+    float b = 2 * dot(offsetRayOrigin, ray.dir);
+    float c = dot(offsetRayOrigin, offsetRayOrigin) - sphere.radius * sphere.radius;
+    
+    float discriminant = b * b - 4 * a * c;
+    
+    if (discriminant >= 0)
+    {
+        float distance = (-b - sqrt(discriminant)) / (2 * a);
+        
+        if (distance >= 0)
+        {
+            hitInfo.didHit = true;
+            hitInfo.distance = distance;
+            hitInfo.hitPoint = ray.origin + ray.dir * distance;
+            hitInfo.normal = normalize(hitInfo.hitPoint - sphere.center);
+            hitInfo.material = sphere.material;
+        }
+    }
+    return hitInfo;
+}
+
+HitInfo RayTriangleIntersection(Ray ray, TriangleInfo tri)
+{
+    float3 edgeAB = tri.vertexB - tri.vertexA;
+    float3 edgeAC = tri.vertexC - tri.vertexA;
+    float3 normalVector = cross(edgeAB, edgeAC);
+    float3 ao = ray.origin - tri.vertexA;
+    float3 dao = cross(ao, ray.dir);
+
+    float determinant = -dot(ray.dir, normalVector);
+    float invDet = 1 / determinant;
+
+	// Calculate dst to triangle & barycentric coordinates of intersection point
+    float dst = dot(ao, normalVector) * invDet;
+    float u = dot(edgeAC, dao) * invDet;
+    float v = -dot(edgeAB, dao) * invDet;
+    float w = 1 - u - v;
+
+    // Initialize hit info
+    HitInfo hitInfo;
+    hitInfo.didHit = determinant >= 1E-8 && dst >= 0 && u >= 0 && v >= 0 && w >= 0;
+    hitInfo.hitPoint = ray.origin + ray.dir * dst;
+    hitInfo.normal = normalize(tri.normalA * w + tri.normalB * u + tri.normalC * v);
+    hitInfo.distance = dst;
+    hitInfo.material = (RayTracingMaterial) 0;
+    return hitInfo;
+}
+
+// Thanks to https://gist.github.com/DomNomNom/46bb1ce47f68d255fd5d
+bool RayBoundingBoxIntersection(Ray ray, float3 boxMin, float3 boxMax)
+{
+    float3 tMin = (boxMin - ray.origin) * ray.invDir;
+    float3 tMax = (boxMax - ray.origin) * ray.invDir;
+    float3 t1 = min(tMin, tMax);
+    float3 t2 = max(tMin, tMax);
+    float tNear = max(max(t1.x, t1.y), t1.z);
+    float tFar = min(min(t2.x, t2.y), t2.z);
+    return tNear <= tFar;
+};
+
+HitInfo CalculateHitInfo(Ray ray)
+{
+    HitInfo closestHit = (HitInfo) 0;
+    float closestDistance = 1000000.0;
+    
+    // Check intersection with all spheres
+    for (int i = 0; i < _SphereInfoCount; i++)
+    {
+        HitInfo currentHit = RaySphereIntersection(ray, SphereInfoBuffer[i]);
+        
+        if (currentHit.didHit && currentHit.distance < closestDistance)
+        {
+            //closestHit = currentHit;
+            closestDistance = currentHit.distance;
+            closestHit.didHit = true;
+            closestHit.distance = closestDistance;
+            closestHit.hitPoint = currentHit.hitPoint;
+            closestHit.normal = currentHit.normal;
+            closestHit.material = currentHit.material;
+        }
+    }
+    
+    for (int k = 0; k < _MeshInfoCount; k++)
+    {
+        MeshInfo mesh = MeshInfoBuffer[k];
+        for (int j = mesh.triangleStart; j < mesh.triangleCount; j++)
+        {
+            HitInfo currentHit = RayTriangleIntersection(ray, TriangleInfoBuffer[j]);
+            if (currentHit.didHit && currentHit.distance < closestDistance)
+            {
+                closestDistance = currentHit.distance;
+                closestHit.didHit = true;
+                closestHit.distance = closestDistance;
+                closestHit.hitPoint = currentHit.hitPoint;
+                closestHit.normal = currentHit.normal;
+                closestHit.material = mesh.material;
+            }
+        }
+    }
+    
+    return closestHit;
+}
+
+float4 CalculateDiffuseComponent(HitInfo hitInfo)
+{
+    float4 diffuseResult = float4(0, 0, 0, 1);
+    
+    for (int i = 0; i < _LightInfoCount; i++)
+    {
+        // Diffuse Component
+        float3 lightDir = LightInfoBuffer[i].position - hitInfo.hitPoint;
+        float minimumDistance = length(lightDir);
+        lightDir = normalize(lightDir);
+        float theta = dot(hitInfo.normal, lightDir);
+        
+        if (theta >= 0.0)
+        {
+            HitInfo shadowHit = (HitInfo) 0;
+            Ray shadowRay = (Ray) 0;
+            shadowRay.origin = hitInfo.hitPoint;
+            shadowRay.dir = lightDir;
+            
+            shadowHit = CalculateHitInfo(shadowRay);
+            if (!shadowHit.didHit)
+            {
+                diffuseResult += hitInfo.material.color * LightInfoBuffer[i].color * theta * hitInfo.material.diffuseFactor * _AllowLocalDiffuseComponent;
+            }
+        }
+    }
+    diffuseResult /= _LightInfoCount;
+    return diffuseResult;
+}
+
+float4 CalculateRefractiveComponent(Ray ray, HitInfo hitInfo, float refractionFactor, float ior)
+{
+    float4 incomingColor = float4(0, 0, 0, 1);
+    int numBounces = 0;
+    
+    float3 refractiveDir = float3(0, 0, 0);
+    float angleIncoming = acos(dot(hitInfo.normal, ray.dir));
+    
+    float angleOut = asin(sin(angleIncoming) / ior);
+    
+    refractiveDir = normalize(-hitInfo.normal / cos(angleOut));
+    ray.dir = refractiveDir;
+    ray.origin = hitInfo.hitPoint - 0.01;
+    
+    for (int i = 1; i < _MaxRecursionDepth; i++)
+    {
+        numBounces++;
+        
+        hitInfo = CalculateHitInfo(ray);
+        if (!hitInfo.didHit)
+        {
+            incomingColor += backgroundColor * refractionFactor;
+            return incomingColor /= numBounces;
+        }
+        float4 ambient = hitInfo.material.color * hitInfo.material.ambientFactor;
+        incomingColor += ambient;
+        incomingColor += CalculateDiffuseComponent(hitInfo) * refractionFactor;
+        if (hitInfo.material.specularFactor == 0)
+        {
+            return incomingColor /= numBounces;
+        }
+        
+        float3 refractiveDir = float3(0, 0, 0);
+        float angleIncoming = acos(dot(hitInfo.normal, ray.dir));
+    
+        float angleOut = asin(sin(angleIncoming) * ior / hitInfo.material.ior);
+        ior = hitInfo.material.ior;
+        
+        refractiveDir = normalize(-hitInfo.normal / cos(angleOut));
+        ray.dir = refractiveDir;
+        ray.origin = hitInfo.hitPoint - 0.01;
+        
+    }
+    incomingColor /= _MaxRecursionDepth;
+    
+    return incomingColor;
+}
+
+float4 CalculateReflectiveComponent(Ray ray, HitInfo hitInfo, float reflexionFactor)
+{
+    float4 incomingColor = float4(0, 0, 0, 1);
+    int numBounces = 0;
+    float ior = 1.0;
+    
+    float3 specularDir = reflect(ray.dir, hitInfo.normal);
+    ray.dir = normalize(specularDir);
+    ray.origin = hitInfo.hitPoint;
+    for (int i = 1; i < _MaxRecursionDepth; i++)
+    {
+        numBounces++;
+        
+        hitInfo = CalculateHitInfo(ray);
+        if (!hitInfo.didHit)
+        {
+            incomingColor += backgroundColor * reflexionFactor;
+            return incomingColor /= numBounces;
+        }
+        float4 ambient = hitInfo.material.color * hitInfo.material.ambientFactor;
+        incomingColor += ambient;
+        incomingColor += CalculateDiffuseComponent(hitInfo) * reflexionFactor;
+        if (hitInfo.material.specularFactor == 0)
+        {
+            return incomingColor /= numBounces;
+        }
+        
+        specularDir = reflect(ray.dir, hitInfo.normal);
+        ray.dir = normalize(specularDir);
+        ray.origin = hitInfo.hitPoint;
+    }
+    incomingColor /= _MaxRecursionDepth;
+    
+    return incomingColor;
+}
+
+float4 TraceRay(Ray ray)
+{
+    float4 incomingColor = float4(0, 0, 0, 1);
+    HitInfo hitInfo = CalculateHitInfo(ray);
+    
+    float reflexionFactor = 0;
+    if (hitInfo.didHit)
+    {
+        float4 ambientResult = hitInfo.material.color * hitInfo.material.ambientFactor * _AllowLocalAmbientComponent;
+        float4 diffuseResult = float4(0, 0, 0, 1);
+        
+        reflexionFactor = hitInfo.material.specularFactor;
+        
+        diffuseResult = CalculateDiffuseComponent(hitInfo);
+        incomingColor += ambientResult + diffuseResult;
+        
+        
+        float4 reflectiveResult = float4(0, 0, 0, 1);
+        if (reflexionFactor != 0 && _AllowLocalSpecularComponent != 0)
+        {
+            reflectiveResult = CalculateReflectiveComponent(ray, hitInfo, reflexionFactor);
+            incomingColor += reflectiveResult * hitInfo.material.color;
+        }
+        
+        float refractionFactor = hitInfo.material.refractionFactor;
+        float4 refractionResult = float4(0, 0, 0, 1);
+        if (refractionFactor > 0 && _AllowLocalRefractiveComponent != 0)
+        {
+            refractionResult = CalculateRefractiveComponent(ray, hitInfo, refractionFactor, hitInfo.material.ior);
+            incomingColor += refractionResult * hitInfo.material.color;
+        }
+    }
+    else
+    {
+        incomingColor += backgroundColor;
+        return incomingColor;
+    }
+    
+    return incomingColor;
+}
+
+
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Result.GetDimensions(width, height);
+    
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    
+    float4 incomingColor = float4(0, 0, 0, 1);
+    
+    Ray ray = (Ray) 0;
+    uint loopCounter = 1 + _NumRaysPerPixel * _AllowAntiAliasing;
+    loopCounter = min(_NumRaysPerPixel, loopCounter);
+    for (uint i = 0; i < loopCounter ; i++)
+    {
+        if (_UseUnityCameraPerspective)
+        {
+            ray = CreateCameraRay(uv, i);
+        }
+        else
+        {
+            ray = GenerateRay(id.xy, uint2(width, height), i);
+        }
+        float4 color = TraceRay(ray);
+        incomingColor += color;
+    }
+    
+    incomingColor /= loopCounter;
+    
+    Result[id.xy] = float4(incomingColor.xyz, 1.0);
+}
