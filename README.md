@@ -19,7 +19,9 @@ Use the UI buttons to load the scene and modify it in real time!
 > Sometimes the application can run slowly, so tweak the settings(image size, lighting settings) if you experience slow downs.
 
 If your changes to the lighting controls are not being displayed, make sure to press the "Local" button and now your changes will affect the scene!
+
 To modify the configuration file used, go to "Assets/Resources/Config" and change the desired filename to "TestScene.txt". The same is applied to the image used for comparision, located in "Assets/SavedImages/3DRenders".
+
 All images are saved to either "Assets/SavedImages/3DRenders" or "Assets/SavedImages/RayTracedImages", depending on how they were generated. They are saved under the following name format: "screenshot_{yyyy-MM-dd-HH-mm-ss}.png".
 
 ## Known Issues
